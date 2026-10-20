@@ -24,8 +24,18 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+:: Locate pythonw.exe (runs without a terminal window)
+for /f "tokens=*" %%i in ('where pythonw 2^>nul') do (
+    if not defined PYTHONW set "PYTHONW=%%i"
+)
+if not defined PYTHONW (
+    echo  Could not find pythonw.exe. Make sure Python is added to PATH.
+    pause
+    exit /b 1
+)
+
 echo  Installing dependencies...
-python -m pip install pynput --quiet
+python -m pip install mss --quiet
 if %errorlevel% neq 0 (
     echo.
     echo  Failed to install dependencies. Check your internet connection
@@ -35,28 +45,27 @@ if %errorlevel% neq 0 (
 )
 
 echo  Setting up auto-start...
-
-:: Write a VBScript launcher so the overlay runs silently with no terminal window
 set "SCRIPT=%~dp0mtgo_priority.py"
-set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mtgo_priority_overlay.vbs"
 
-(
-    echo Set sh = CreateObject^("WScript.Shell"^)
-    echo sh.Run "pythonw """ ^& "%SCRIPT%" ^& """", 0, False
-) > "%STARTUP%"
+:: Remove any previous task before creating a fresh one
+schtasks /Delete /TN "MTGOPriorityOverlay" /F >nul 2>&1
+
+schtasks /Create /TN "MTGOPriorityOverlay" /TR "\"%PYTHONW%\" \"%SCRIPT%\"" /SC ONLOGON /RU "%USERNAME%" /RL HIGHEST /F >nul
+if %errorlevel% neq 0 (
+    echo.
+    echo  Failed to create the startup task. Try running this installer
+    echo  as Administrator (right-click install.bat, Run as administrator).
+    pause
+    exit /b 1
+)
 
 echo.
-echo  Done! The overlay will now start automatically every time
-echo  Windows starts.
+echo  Done! The overlay will start automatically every time Windows starts.
 echo.
 echo  Starting the overlay now...
-echo.
-echo  The first time it runs, a setup window will appear.
-echo  Follow the instructions to calibrate it for your screen.
-echo.
+start "" "%PYTHONW%" "%SCRIPT%"
 
-start "" pythonw "%SCRIPT%"
-
+echo.
 echo  Setup complete. You can close this window.
 echo.
 pause

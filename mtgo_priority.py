@@ -15,14 +15,20 @@ import threading
 import subprocess
 import tkinter as tk
 
-OVERLAY_TEXT    = "HOLDING PRIORITY"
-OVERLAY_W       = 220
-OVERLAY_H       = 28
-OVERLAY_PAD_X   = 20   # padding from left edge of game board
-OVERLAY_PAD_Y   = 55   # padding up from bottom of MTGO window (above phase bar)
-# Fraction of MTGO window width where the game board starts (left panels occupy ~30%)
-GAME_BOARD_LEFT_FRAC = 0.30
-POLL_MS         = 50
+try:
+    import mss
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "mss"], check=True)
+    import mss
+
+OVERLAY_TEXT          = "HOLDING PRIORITY"
+OVERLAY_W             = 220
+OVERLAY_H             = 28
+OVERLAY_PAD_X         = 20    # gap between game board left edge and overlay
+GAME_BOARD_Y_FRAC     = 0.73  # phase bar is ~73% down the MTGO window height
+# Brightness threshold for detecting end of dark side panel vs grey game board
+PANEL_BRIGHTNESS_THRESHOLD = 65
+POLL_MS               = 50
 
 user32   = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -71,18 +77,64 @@ def _get_mtgo_rect():
     return found[0]
 
 
+def _find_game_board_left(rect):
+    """Scan a horizontal row to find where the game board grey background starts.
+
+    The side panel contains bright card text (near-white) and card art. Requiring
+    20 consecutive medium-grey pixels (60-145 brightness, low colour saturation)
+    skips over isolated text characters and finds the solid game board background.
+    """
+    left, top, right, bottom = rect
+    win_h = bottom - top
+    scan_y = top + int(win_h * 0.50)
+    scan_x_start = left + 30
+    scan_x_end   = min(left + 500, right - 50)
+    try:
+        with mss.mss() as sct:
+            region = {
+                "top":    scan_y,
+                "left":   scan_x_start,
+                "width":  scan_x_end - scan_x_start,
+                "height": 1,
+            }
+            shot = sct.grab(region)
+        consecutive = 0
+        for i in range(shot.width):
+            r, g, b = shot.pixel(i, 0)[:3]
+            brightness = (r + g + b) / 3
+            # Medium grey: not dark panel, not bright text/art, roughly neutral hue
+            is_board_grey = (
+                60 < brightness < 145
+                and abs(r - g) < 25
+                and abs(g - b) < 25
+            )
+            if is_board_grey:
+                consecutive += 1
+                if consecutive >= 20:
+                    return scan_x_start + i - 19
+            else:
+                consecutive = 0
+    except Exception:
+        pass
+    # Fallback: 10% from window left edge
+    return left + int((right - left) * 0.10)
+
+
 def _overlay_pos():
     """Compute (x, y) for the overlay based on the current MTGO window rect."""
     rect = _get_mtgo_rect()
     if rect:
         left, top, right, bottom = rect
-        game_left = left + int((right - left) * GAME_BOARD_LEFT_FRAC)
+        win_h     = bottom - top
+        game_left = _find_game_board_left(rect)
         x = game_left + OVERLAY_PAD_X
-        y = bottom - OVERLAY_PAD_Y - OVERLAY_H
+        phase_y = top + int(win_h * GAME_BOARD_Y_FRAC)
+        y = phase_y - OVERLAY_H - 30
         return x, y
-    # Fallback: bottom-left of screen
+    # Fallback: centre-left of screen
+    sw = user32.GetSystemMetrics(0)
     sh = user32.GetSystemMetrics(1)
-    return 600, sh - OVERLAY_PAD_Y - OVERLAY_H
+    return sw // 4, sh - 200 - OVERLAY_H
 
 
 def _key_down(vk):

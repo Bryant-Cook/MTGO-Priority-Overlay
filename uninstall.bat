@@ -6,20 +6,13 @@ echo  MTGO Priority Overlay - Uninstaller
 echo  =====================================
 echo.
 
-set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\mtgo_priority_overlay.vbs"
-set "CONFIG=%USERPROFILE%\.mtgo_priority_config.json"
+:: Stop the running overlay
+taskkill /F /IM pythonw.exe >nul 2>&1
 
-if exist "%STARTUP%" (
-    del "%STARTUP%"
-    echo  Removed auto-start entry.
-) else (
-    echo  No auto-start entry found.
-)
-
-if exist "%CONFIG%" (
-    del "%CONFIG%"
-    echo  Removed saved calibration.
-)
+:: Remove the scheduled task
+schtasks /End /TN "MTGOPriorityOverlay" >nul 2>&1
+schtasks /Delete /TN "MTGOPriorityOverlay" /F >nul 2>&1
+echo  Removed auto-start entry.
 
 echo.
 echo  Uninstall complete. The overlay will no longer start with Windows.
