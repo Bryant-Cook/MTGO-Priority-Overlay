@@ -25,7 +25,7 @@ if %errorlevel% neq 0 (
 )
 
 echo  Installing dependencies...
-python -m pip install mss --quiet
+python -m pip install pynput --quiet
 if %errorlevel% neq 0 (
     echo.
     echo  Failed to install dependencies. Check your internet connection

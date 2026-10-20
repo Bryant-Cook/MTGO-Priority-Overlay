@@ -1,139 +1,119 @@
 #!/usr/bin/env python3
 """
 MTGO Priority Overlay
-Displays a "HOLDING PRIORITY" overlay while you hold priority in Magic Online.
-Double-click launch.command (macOS) or run this file directly to start.
-Right-click the overlay at any time to recalibrate or quit.
+Shows a "HOLDING PRIORITY" overlay when you hold Ctrl and click to cast a
+spell or activate an ability in an active MTGO match.
+Anchors itself to the bottom-left corner of the MTGO game board and
+repositions whenever the window moves or is resized.
+Right-click the overlay to quit.
 """
 
 import sys
-import json
+import ctypes
 import time
 import threading
-from pathlib import Path
+import subprocess
 import tkinter as tk
 
-# Auto-install mss if missing
-try:
-    import mss
-except ImportError:
-    import subprocess
-    print("Installing mss...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "mss"], check=True)
-    import mss
+OVERLAY_TEXT    = "HOLDING PRIORITY"
+OVERLAY_W       = 220
+OVERLAY_H       = 28
+OVERLAY_PAD_X   = 20   # padding from left edge of game board
+OVERLAY_PAD_Y   = 55   # padding up from bottom of MTGO window (above phase bar)
+# Fraction of MTGO window width where the game board starts (left panels occupy ~30%)
+GAME_BOARD_LEFT_FRAC = 0.30
+POLL_MS         = 50
 
-# ── Configuration ─────────────────────────────────────────────────────────
-CONFIG_FILE           = Path.home() / ".mtgo_priority_config.json"
-POLL_INTERVAL         = 0.25   # seconds between screen samples
-TOLERANCE             = 35     # RGB match threshold (0-255 per channel)
-OVERLAY_TEXT          = "HOLDING PRIORITY"
-OVERLAY_X             = 250    # pixels from left edge of screen
-OVERLAY_BOTTOM_OFFSET = 340    # pixels from bottom of screen
+user32   = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 
+VK_CONTROL = 0x11
+VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
+COMBO_VKS  = list(range(0x41, 0x5B))  # A–Z
 
-# ── Config ────────────────────────────────────────────────────────────────
-
-def load_config():
-    if CONFIG_FILE.exists():
-        return json.loads(CONFIG_FILE.read_text())
-    return None
+_WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_size_t, ctypes.c_size_t)
 
 
-def save_config(data):
-    CONFIG_FILE.write_text(json.dumps(data, indent=2))
+# ── Window helpers ────────────────────────────────────────────────────────
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
-# ── Pixel sampling ────────────────────────────────────────────────────────
+def _get_mtgo_rect():
+    """Return (left, top, right, bottom) of the MTGO window, or None."""
+    found = [None]
 
-def sample_pixel(x, y):
-    with mss.mss() as sct:
-        region = {"top": y, "left": x, "width": 2, "height": 2}
-        shot = sct.grab(region)
-        p = shot.pixel(0, 0)
-        return p[0], p[1], p[2]
+    def _cb(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        h = kernel32.OpenProcess(0x1000, False, pid.value)
+        if not h:
+            return True
+        buf  = ctypes.create_unicode_buffer(512)
+        size = ctypes.c_ulong(512)
+        kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+        kernel32.CloseHandle(h)
+        if "mtgo" in buf.value.lower():
+            rect = _RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            if rect.right - rect.left > 400:
+                found[0] = (rect.left, rect.top, rect.right, rect.bottom)
+                return False
+        return True
+
+    cb = _WNDENUMPROC(_cb)
+    user32.EnumWindows(cb, 0)
+    return found[0]
 
 
-def color_matches(pixel, target, tolerance):
-    return all(abs(pixel[i] - target[i]) <= tolerance for i in range(3))
+def _overlay_pos():
+    """Compute (x, y) for the overlay based on the current MTGO window rect."""
+    rect = _get_mtgo_rect()
+    if rect:
+        left, top, right, bottom = rect
+        game_left = left + int((right - left) * GAME_BOARD_LEFT_FRAC)
+        x = game_left + OVERLAY_PAD_X
+        y = bottom - OVERLAY_PAD_Y - OVERLAY_H
+        return x, y
+    # Fallback: bottom-left of screen
+    sh = user32.GetSystemMetrics(1)
+    return 600, sh - OVERLAY_PAD_Y - OVERLAY_H
 
 
-# ── Calibration window ────────────────────────────────────────────────────
+def _key_down(vk):
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
-class CalibrationWindow:
-    def __init__(self, on_complete):
-        self.on_complete = on_complete
-        self.root = tk.Tk()
-        self.root.title("MTGO Priority Overlay")
-        self.root.resizable(False, False)
-        self.root.attributes("-topmost", True)
-        self.root.configure(bg="#1e1e1e")
-        self._build()
-        self.root.mainloop()
 
-    def _build(self):
-        pad = {"padx": 24, "pady": 6, "bg": "#1e1e1e"}
+def _any_combo_key():
+    return any(_key_down(vk) for vk in COMBO_VKS)
 
-        tk.Label(
-            self.root, text="MTGO Priority Overlay",
-            font=("Helvetica", 16, "bold"), fg="white", **pad
-        ).pack(pady=(20, 2))
 
-        tk.Label(
-            self.root, text="Calibration required",
-            font=("Helvetica", 11), fg="#888888", **pad
-        ).pack(pady=(0, 12))
+def _foreground_exe_and_title():
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return "", ""
+    pid = ctypes.c_ulong()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    h = kernel32.OpenProcess(0x1000, False, pid.value)
+    exe_buf  = ctypes.create_unicode_buffer(512)
+    exe_size = ctypes.c_ulong(512)
+    if h:
+        kernel32.QueryFullProcessImageNameW(h, 0, exe_buf, ctypes.byref(exe_size))
+        kernel32.CloseHandle(h)
+    n   = user32.GetWindowTextLengthW(hwnd)
+    ttl = ctypes.create_unicode_buffer(n + 1)
+    user32.GetWindowTextW(hwnd, ttl, n + 1)
+    return exe_buf.value.lower(), ttl.value
 
-        tk.Label(
-            self.root,
-            text=(
-                "1.  Open MTGO and start a game.\n"
-                "2.  Hold priority so the OK button is visible.\n"
-                "3.  Click Start, then move your mouse\n"
-                "     over the OK button.\n"
-                "4.  You have 5 seconds."
-            ),
-            font=("Helvetica", 11), fg="#cccccc",
-            justify="left", **pad
-        ).pack(pady=(0, 12))
 
-        self.status = tk.Label(
-            self.root, text="",
-            font=("Helvetica", 13, "bold"), fg="#ffcc00", **pad
-        )
-        self.status.pack(pady=(0, 8))
-
-        self.btn = tk.Button(
-            self.root, text="Start Calibration",
-            font=("Helvetica", 12, "bold"),
-            bg="#2e6be6", fg="white",
-            activebackground="#1a4fc4", activeforeground="white",
-            relief="flat", padx=18, pady=10,
-            command=self._start
-        )
-        self.btn.pack(pady=(0, 20))
-
-    def _start(self):
-        self.btn.config(state="disabled")
-        threading.Thread(target=self._countdown, daemon=True).start()
-
-    def _countdown(self):
-        for i in range(5, 0, -1):
-            self.status.config(text=f"Move mouse to indicator... {i}")
-            time.sleep(1)
-
-        x = self.root.winfo_pointerx()
-        y = self.root.winfo_pointery()
-        r, g, b = sample_pixel(x, y)
-
-        save_config({"x": x, "y": y, "color": {"r": r, "g": g, "b": b}})
-
-        self.status.config(text=f"Saved!  RGB({r}, {g}, {b})")
-        self.btn.config(text="Start Overlay", state="normal", bg="#27ae60",
-                        command=self._finish)
-
-    def _finish(self):
-        self.root.destroy()
-        self.on_complete()
+def _in_mtgo_match():
+    exe, title = _foreground_exe_and_title()
+    return "mtgo" in exe and "vs." in title.lower()
 
 
 # ── Overlay ───────────────────────────────────────────────────────────────
@@ -152,34 +132,33 @@ class Overlay:
         except tk.TclError:
             pass
 
-        sh = self.root.winfo_screenheight()
-        self.root.geometry(f"180x40+{OVERLAY_X}+{sh - OVERLAY_BOTTOM_OFFSET}")
+        x, y = _overlay_pos()
+        self.root.geometry(f"{OVERLAY_W}x{OVERLAY_H}+{x}+{y}")
         self.root.configure(bg="#111111")
 
-        self.label = tk.Label(
-            self.root, text=OVERLAY_TEXT,
-            font=("Helvetica", 14, "bold"),
-            fg="white", bg="#111111",
-        )
-        self.label.pack(expand=True, fill="both")
+        frame = tk.Frame(self.root, bg="#111111")
+        frame.pack(expand=True, fill="both", padx=10)
+        tk.Label(frame, text="◆", font=("Helvetica", 9),
+                 fg="#ffaa00", bg="#111111").pack(side="left", padx=(0, 5))
+        tk.Label(frame, text=OVERLAY_TEXT, font=("Helvetica", 11, "bold"),
+                 fg="white", bg="#111111").pack(side="left")
 
-        # Right-click context menu
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Recalibrate", command=self._recalibrate)
-        self.menu.add_separator()
-        self.menu.add_command(label="Quit", command=self.root.destroy)
-        self.root.bind("<Button-3>", self._show_menu)
-        self.label.bind("<Button-3>", self._show_menu)
+        self.menu.add_command(label="Quit", command=self._quit)
+        for widget in (self.root, frame):
+            widget.bind("<Button-3>", self._show_menu)
 
         self.root.withdraw()
-        self._visible = False
+        self._visible  = False
+        self._running  = True
+        self._last_pos = (x, y)
 
     def _show_menu(self, event):
         self.menu.tk_popup(event.x_root, event.y_root)
 
-    def _recalibrate(self):
+    def _quit(self):
+        self._running = False
         self.root.destroy()
-        CalibrationWindow(on_complete=lambda: Overlay().run())
 
     def show(self):
         if not self._visible:
@@ -191,35 +170,67 @@ class Overlay:
             self._visible = False
             self.root.after(0, self.root.withdraw)
 
+    def _reposition(self):
+        x, y = _overlay_pos()
+        if (x, y) != self._last_pos:
+            self._last_pos = (x, y)
+            geo = f"{OVERLAY_W}x{OVERLAY_H}+{x}+{y}"
+            self.root.after(0, lambda g=geo: self.root.geometry(g))
+
     def run(self):
-        cfg = load_config()
-        x      = cfg["x"]
-        y      = cfg["y"]
-        target = (cfg["color"]["r"], cfg["color"]["g"], cfg["color"]["b"])
-
-        def poll():
-            while True:
-                try:
-                    pixel = sample_pixel(x, y)
-                    if color_matches(pixel, target, TOLERANCE):
-                        self.show()
-                    else:
-                        self.hide()
-                except Exception:
-                    pass
-                time.sleep(POLL_INTERVAL)
-
-        threading.Thread(target=poll, daemon=True).start()
+        threading.Thread(target=self._poll, daemon=True).start()
         self.root.mainloop()
+        self._running = False
 
+    def _poll(self):
+        prev_ctrl = False
+        prev_lbtn = False
+        prev_rbtn = False
+        had_combo = False
 
-# ── Entry point ───────────────────────────────────────────────────────────
+        mtgo_cache      = False
+        mtgo_cache_time = 0.0
+        pos_check_time  = 0.0
+
+        while self._running:
+            now  = time.monotonic()
+            ctrl = _key_down(VK_CONTROL)
+            lbtn = _key_down(VK_LBUTTON)
+            rbtn = _key_down(VK_RBUTTON)
+
+            # Refresh MTGO match status every 500ms
+            if now - mtgo_cache_time > 0.5:
+                mtgo_cache      = _in_mtgo_match()
+                mtgo_cache_time = now
+
+            # Reposition overlay every second in case window moved
+            if now - pos_check_time > 1.0:
+                self._reposition()
+                pos_check_time = now
+
+            # Ctrl released
+            if prev_ctrl and not ctrl:
+                had_combo = False
+                self.hide()
+
+            # Another key while Ctrl held = keyboard shortcut, not a cast
+            if ctrl and _any_combo_key():
+                had_combo = True
+                self.hide()
+
+            # Left or right click while Ctrl held = casting / activating
+            click_started = (lbtn and not prev_lbtn) or (rbtn and not prev_rbtn)
+            if click_started and ctrl and not had_combo and mtgo_cache:
+                self.show()
+
+            prev_ctrl = ctrl
+            prev_lbtn = lbtn
+            prev_rbtn = rbtn
+            time.sleep(POLL_MS / 1000)
+
 
 def main():
-    if load_config() is None:
-        CalibrationWindow(on_complete=lambda: Overlay().run())
-    else:
-        Overlay().run()
+    Overlay().run()
 
 
 if __name__ == "__main__":
