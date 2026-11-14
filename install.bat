@@ -50,11 +50,16 @@ set "SCRIPT=%~dp0mtgo_priority.py"
 :: Remove any previous task before creating a fresh one
 schtasks /Delete /TN "MTGOPriorityOverlay" /F >nul 2>&1
 
-schtasks /Create /TN "MTGOPriorityOverlay" /TR "\"%PYTHONW%\" \"%SCRIPT%\"" /SC ONLOGON /RU "%USERNAME%" /RL HIGHEST /F >nul
+:: Create the logon task with PowerShell, because schtasks /Create cannot change
+:: the task settings. The settings remove the default 72-hour run limit, allow
+:: the task on battery power, restart the overlay if it fails, and prevent a
+:: second copy from starting. The 15-second delay gives shared folders time to
+:: connect after logon (for example, \\Mac\Home in a Parallels VM).
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $a = New-ScheduledTaskAction -Execute $env:PYTHONW -Argument ([char]34 + $env:SCRIPT + [char]34); $t = New-ScheduledTaskTrigger -AtLogOn -User ($env:USERDOMAIN + '\' + $env:USERNAME); $t.Delay = 'PT15S'; $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); $p = New-ScheduledTaskPrincipal -UserId ($env:USERDOMAIN + '\' + $env:USERNAME) -LogonType Interactive -RunLevel Highest; Register-ScheduledTask -TaskName 'MTGOPriorityOverlay' -Action $a -Trigger $t -Settings $s -Principal $p -Force -ErrorAction Stop | Out-Null } catch { Write-Host $_; exit 1 }"
 if %errorlevel% neq 0 (
     echo.
     echo  Failed to create the startup task. Try running this installer
-    echo  as Administrator (right-click install.bat, Run as administrator).
+    echo  as Administrator ^(right-click install.bat, Run as administrator^).
     pause
     exit /b 1
 )
@@ -63,7 +68,8 @@ echo.
 echo  Done! The overlay will start automatically every time Windows starts.
 echo.
 echo  Starting the overlay now...
-start "" "%PYTHONW%" "%SCRIPT%"
+:: Start through the task so that the task blocks a second copy
+schtasks /Run /TN "MTGOPriorityOverlay" >nul
 
 echo.
 echo  Setup complete. You can close this window.
